@@ -11,6 +11,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -95,4 +96,37 @@ pub fn veri(bayt: usize, tohum: u8) -> Vec<u8> {
 /// Bayt dizisini hex'e çevirir (hata mesajlarında kullanılır).
 pub fn hex(bayt: &[u8]) -> String {
     bayt.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Bir dizin ağacının tam dökümü: göreli yol → (bayt, salt-okunur bayrağı).
+///
+/// **Veri güvenliği testlerinin temel aracıdır.** Bir komut hata döndürdükten
+/// sonra bu dökümün **boş** kaldığını kanıtlamak, o komutun diskte yarım bir
+/// çıktı bırakmadığını gösterir. Boyut *ve* izin birlikte karşılaştırılır;
+/// aksi halde "içerik silindi ama boş dosya kaldı" gibi sinsi artıklar görünmez.
+pub fn agac_dokumu(kok: &Path) -> BTreeMap<String, (u64, bool)> {
+    let mut harita = BTreeMap::new();
+    let mut yigin: Vec<PathBuf> = vec![kok.to_path_buf()];
+    while let Some(dizin) = yigin.pop() {
+        let Ok(girdiler) = fs::read_dir(&dizin) else {
+            continue;
+        };
+        for giris in girdiler.flatten() {
+            let yol = giris.path();
+            let goreli = yol
+                .strip_prefix(kok)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| yol.to_string_lossy().into_owned());
+            let Ok(meta) = fs::symlink_metadata(&yol) else {
+                continue;
+            };
+            if meta.is_dir() {
+                harita.insert(goreli.clone(), (0, meta.permissions().readonly()));
+                yigin.push(yol);
+            } else {
+                harita.insert(goreli, (meta.len(), meta.permissions().readonly()));
+            }
+        }
+    }
+    harita
 }

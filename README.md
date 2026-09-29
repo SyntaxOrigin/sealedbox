@@ -32,7 +32,12 @@ Kriptografik çekirdek el yazımı **değildir**; `aes-gcm`, `argon2`, `hkdf`, `
   (başlık, manifest, sonradan eklenen baytlar) yakalar.
 - **Kaldığı yerden devam.** Mühürleme yarıda kesilirse `mseal sifrele --devam`
   tamamlanmış parçaları tekrar üretmeden sürdürür. Nonce'lar kapsülün kendi
-  manifest'inden okunur; hiçbir parça nonce'u yeniden kullanılmaz.
+  manifest'inden okunur; hiçbir parça nonce'u yeniden kullanılmaz. Devam sınırı
+  **yalnızca diske zorlanmış baytlara** güvenir: gövde `sync_data` ile
+  zorlandıktan sonra başlığa yazılır, en fazla 8 MiB geride kalır
+  ([ayrıntılı kapsam](https://github.com/SyntaxOrigin/sealedbox#kaldığı-yerden-devamın-kalıcılık-garantisi)).
+- **Başarısız çözmede disk artığı bırakmama.** Parça etiketi tutmazsa
+  oluşturulmuş ağacın tamamı kaldırılır; `ac` ikinci kez çalıştırılabilir.
 - **`zeroize` ile bellek temizliği.** Ana anahtar, alt anahtar, düz metin tamponu
   ve şifreli manifest tamponları `Zeroizing` içinde taşınır; etiket doğrulanmadan
   çözülen düz metin **hiçbir yere yazılmaz** ve hata yolunda sıfırlanır.
@@ -272,23 +277,27 @@ test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 running 12 tests
 test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.30s
 
+running 8 tests
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.58s
+
 running 5 tests
-test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.40s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.73s
 
    Doc-tests sealedbox
 
 running 1 test
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
 ```
 
-**Toplam: 89 test, 89 geçti, 0 başarısız.**
+**Toplam: 97 test, 97 geçti, 0 başarısız.**
 
 | Hedef | Test sayısı | Kapsam |
 |---|---|---|
 | `src/lib.rs` birim testleri | 51 | kriptografi, biçim, dizin, gezgin, akış |
 | `tests/gidis_donus.rs` | 12 | gidiş-dönüş, akış, klasör ağacı |
 | `tests/bozulma_senaryolari.rs` | 20 | bozulma ve saldırı senaryoları |
-| `tests/kaldigi_yerden_devam.rs` | 5 | kesinti kurtarma |
+| `tests/kaldigi_yerden_devam.rs` | 8 | kesinti kurtarma ve devam sınırının kalıcılığı |
+| `tests/yarim_cikti_temizligi.rs` | 5 | başarısız çözmede disk artığı bırakılmaması |
 | Doc-test (`src/lib.rs` örneği) | 1 | derleme denetimi |
 
 ### Yayımlanmış test vektörleri
@@ -341,7 +350,8 @@ cargo fmt --check                          # çıktı boş
     ├── yardimci/mod.rs           geçici dizin yardımcısı (tempfile'siz)
     ├── gidis_donus.rs            gidiş-dönüş ve akış testleri
     ├── bozulma_senaryolari.rs    bozulma / saldırı testleri
-    └── kaldigi_yerden_devam.rs   kesinti kurtarma testleri
+    ├── kaldigi_yerden_devam.rs   kesinti kurtarma ve devam sınırının kalıcılığı
+    └── yarim_cikti_temizligi.rs  başarısız çözmede disk artığı bırakılmaması
 ```
 
 ### Kapsül biçimi (`SBX1`, sürüm 1)
@@ -363,13 +373,58 @@ cargo fmt --check                          # çıktı boş
   ---- AES-GCM AAD = [0..64]; bu önek mühürleme boyunca DEĞİŞMEZ ----
   64..72  manifest için ayrılan bayt
   72..80  planlanan payload uzunluğu
-  80..88  yazılan offset          (kaldığı yerden devam sınırı)
+  80..88  yazılan offset          (kaldığı yerden devam sınırı; KALICILIĞIN
+                                  YALNIZCA sync_data sonrası yazılan kısmıdır)
   88..92  durum (0 = tamam, 1 = yazılıyor)
 [şifreli manifest + 16 bayt etiket]
 [parça gövdeleri]
   her parça: nonce(12) ‖ uzunluk(4) ‖ şifre metni ‖ etiket(16)
 [64 bayt SHA-512 kuyruk özeti]   ← [0 .. len-64) aralığının özeti
 ```
+
+### Kaldığı yerden devamın kalıcılık garantisi
+
+`80..88` alanı bir **ilerleme sayacı değil, kalıcılık beyanıdır**: "buraya kadar
+olan gövde baytları diske zorlandı". Bu beyan ancak gövde `sync_data` ile
+zorlandıktan **sonra** başlığa yazılır.
+
+```text
+   parça yaz  →  parça yaz  →  …  →  bekleyen ≥ 8 MiB
+                                          │
+                                          ├─ File::sync_data()   ← gövde kalıcı
+                                          └─ yazılan_offset = n  ← sonra beyan
+```
+
+Sıralamanın tersi (önce beyan, sonra `fsync`) bir kapsülü **kalıcı olarak
+bozuk** bırakabilirdi: elektrik kesintisinde başlık "şu kadar bayt yazıldı"
+der, parça verisi ise kaybolmuş olur; `devam_ac` o parçayı yeniden üretmeden
+atlar ve nonce'i harcanmış sayar. GCM etiketleri sessiz düz metni yakalar ama
+kurtarma yolu kalıcı kapanır.
+
+**Gerçek kapsam ve sınırları:**
+
+| Durum | Davranış |
+|---|---|
+| `sync_data` tamamlanmadan kesinti | Başlık **önceki** kalıcı sınırı gösterir; 8 MiB'den az yeniden üretilir. Güvenli. |
+| Tam parça sınırı | `yazilan_offset` her zaman **tam bir parça kaydının** sonundadır; yarım parça "yazılmış" sayılmaz. |
+| Eşiği aşan parça | Atlanmaz; `devam_ac` onu yeniden üretir. |
+| Kırpma (`devam_ac`) | Kırpma da `sync_all` ile kalıcıdır; ikinci kesintide yarım parça geri gelmez. |
+| Mühürleme sonu | Son başlık (`durum = TAMAM`) ve kuyruk özeti `sync_all` ile zorlanır, **sonra** `rename` edilir. |
+
+**Yeniden üretim neden güvenlidir.** Geride kalan parçanın nonce'u diskteki
+manifest'ten okunur; nonce **yeniden üretilmez**. Aynı anahtar + aynı nonce +
+aynı AAD + aynı düz metin, GCM'de **bit bit aynı** şifre metnini verir; yani
+yeniden üretim nonce'u harcamaz, yalnızca aynı kaydı tekrar yazar.
+
+**Maliyet.** Parça başına `fsync` çağırmak yerine 8 MiB
+(`akis::KALICILIK_ARALIGI`) toplanır. Varsayılan 2 MiB parçayla 100 MiB
+dosyada bu parça başına ~50 yerine ~12 `fsync` demektir.
+
+**Bu garanti neyi kapsamaz:** yalnızca uygulamanın kendi yazma sırasını
+kapsar. İşletim sistemi önbelleğini `fsync` çağrısından önce çevrimdışı alıyorsa
+(=`sync_data` çağrısı yine de başarılı döner) garanti geçerlidir; disk
+donanımının kendi yazma önbelleğini yazma bariyerine rağmen kaybettiği durum
+bu kapsamın **dışındadır** ve yazılımla giderilemez.
 
 ---
 
@@ -445,6 +500,13 @@ Bu bölüm kasıtlı olarak dürüsttür. Hiçbir madde ölçülmüş veya gizli
 - **Kaldığı yerden devam etiket yazma sırasına duyarlıdır.** Devam, tamamlanmış
   parçaların atlanmasıyla çalışır; parçalar arası "herhangi bir noktadan başla"
   yeteneği yoktur.
+- **Başarısız çözmede ağaç temizlenir, ama hedef birden fazla dosyaysa iş
+  tekrarlanabilir olmaz.** Etiket tutmayan bir parçada oluşturulan ağacın tamamı
+  kaldırılır (`tests/yarim_cikti_temizligi.rs` bunu ağaç dökümüyle kanıtlar), bu
+  yüzden hassas veri yarım hâlde diskte kalmaz ve `ac` ikinci kez çalıştırılabilir.
+  Ancak `--ustune-yaz` ile hedef agacın **önceki** hâli geri yüklenemez: eski
+  ağaç yeni yazım başlamadan önce silinir. Geri alınabilir bir çözme için
+  [geçici dizine yazıp atomik taşıma](#gelecek-geliştirmeler) gerekir.
 
 ### Teknik sınırlar
 
@@ -505,6 +567,17 @@ Bu bölüm kasıtlı olarak dürüsttür. Hiçbir madde ölçülmüş veya gizli
   bu depoda 1.74 toolchain'i ile derleme yapılmamıştır (ortamda yalnızca 1.98.1 ve
   1.98.1-msvc vardır). MSRV'nin gerçekten 1.74 mü olduğu **test edilmemiştir**.
 
+- **Kaldığı yerden devam yalnızca kendi yazma sırasına güvenir.** Devam sınırı
+  `sync_data` ile zorlanmış baytlardan oluşur (bkz.
+  [Kaldığı yerden devamın kalıcılık garantisi](#kaldığı-yerden-devamın-kalıcılık-garantisi));
+  bu, uygulamanın kendi yazma sırasını garanti eder, **disk donanımının** kendi
+  yazma önbelleğini yazma bariyerine rağmen kaybettiği (güç kesintisi, denetleyici
+  hatası) durumları kapsam dışıdır. Ek olarak kapsülün `rename` edilmesi
+  dizinin üst dizinine göre kalıcı hâle getirilmez (dizin `fsync`'i platform
+  bağımlıdır), bu yüzden `rename` ile kapsül hedef yola düştükten hemen sonra
+  oluşan bir güç kesintisi kapsülü `*.sbxtmp` halinde bırakabilir. Kapsül içeriği
+  bozulmaz; `--devam` ile yeniden denemek yeterlidir.
+
 - **Kapsül dosyasının izinleri daraltılmaz.** Rapor b09 "dosya sistemi önlemleri"
   (kapsul dosyası izinlerinin daraltılması) ister; bu sürümde yapılmamıştır.
 
@@ -519,6 +592,7 @@ Bu bölüm kasıtlı olarak dürüsttür. Hiçbir madde ölçülmüş veya gizli
 | `#[cfg(test)] mod tests` blokları (her modülde) | `clippy::unwrap_used` / `expect_used`; WORKER_CONTRACT §4.2 testlerde bunlara izin verir |
 | `akis.rs::devam_ac` | `clippy::type_complexity` — 5 alanlı `Option<(File, SabitBaslik, Zeroizing<..>, [u8;16], DizinKaydi)>` dönüşü; yeni bir tip adı hata ayıklama okunurluğunu düşürürdü |
 | `akis.rs::kapsul_ac` | `clippy::type_complexity` — 3 alanlı demet dönüşü |
+| `akis.rs::ac_govde` | `clippy::too_many_arguments` — 9 parametre; ikisi (`kapsul_yolu`, `kok`) çözme durumudur, kalanı manifest/başlık/anahtar bağlamıdır. Hata halinde ağacın temizlenmesi gerektiği için `ac`'den ayrılmak zorunda kaldı |
 
 ---
 
@@ -542,6 +616,20 @@ Bu bölüm kasıtlı olarak dürüsttür. Hiçbir madde ölçülmüş veya gizli
 8. **Çok iş parçacılı parça şifreleme** — kuyruk derinliği 2 ile (rapor b08).
 9. **Biçim belgesi (`FORMAT.md`)** — kapsül sürüm 2 için sürümleme kuralları
    (rapor b16 hafta 1 aksiyonu).
+10. **Geçici dizine yazıp doğrulama sonrası atomik taşıma.** Bugün `ac` doğrudan
+    hedefe yazar ve hatada oluşturduğu ağacı **kaldırır**; bu, yarım veri
+    bırakmaz ama iki noktada eksiktir:
+    - `--ustune-yaz` ile hedef ağacın **önceki** hâli geri getirilemez (önce
+      silinir, sonra yazılır).
+    - Temizlik `remove_*` çağrısına dayanır; dosya kilitliyse
+      `Hata::YarimCiktiKaldi` ile bildirilir ama yarım veri yine de kalır.
+
+    Çözüm: çözme `hedef/.mseal-gecici-<rastgele>/` altında yapılır, tüm parça
+    etiketleri doğrulandıktan ve boyutlar manifest ile karşılaştırıktan **sonra**
+    ağaç hedefe `rename` edilir. Aynı dosya sisteminde `rename` atomiktir, bu
+    yüzden hedef ya eski hâlini ya da tam yeni ağacı gösterir — asla yarım.
+    Kapsül dosyası zaten bu şekilde çalışıyor (`*.sbxtmp` → `rename`); çözme
+    tarafına aynı disiplin taşınacak.
 
 ---
 
@@ -584,6 +672,12 @@ parçalar atlanır. Kaynak değişmişse devam reddedilir ve sıfırdan başlan�
 istemiyorsanız `--devam` kullanmadan çalıştırın; geçici dosya silinip yeniden
 yazılır.
 
+`--devam` **atlanan** parça sayısını raporlamaz; sadece devam yolunun kullanılıp
+kullanılmadığını bildirir. Devam sınırı diske zorlanmış baytlardan oluştuğu
+için en fazla 8 MiB geride kalır ve geride kalan parçalar yeniden üretilir
+([bkz.](#kaldığı-yerden-devamın-kalıcılık-garantisi)). Ağır bir kesintiden sonra
+beklenen şey "son parçadan devam" değil, "son kalıcı sınırdan devam"dır.
+
 ### 5. `Argon2 bellek maliyeti ... KiB; izinli aralik 16384..262144`
 
 **Belirti:** `--argon2-bellek-kib` çok küçük veya çok büyük verilmiş.
@@ -601,6 +695,20 @@ dosyasını kısa süre kilitledi.
 girdinin boyutundan **her zaman büyüktür** (parça başına 32 bayt kayıt yükü +
 96 bayt başlık + manifest + 64 bayt kuyruk özeti). `mseal mseal-info` çıktısındaki
 `Etik yuku` yüzdesi bu yükü gösterir.
+
+### 7. `cozme basarisiz oldu ve yarim cikti kaldirilamadi: '<yol>'`
+
+**Belirti:** Çözme bir parça etiketi (veya okuma hatası) nedeniyle başarısız
+oldu ve oluşturduğu ağacı `remove_*` ile kaldıramadı; mesaj ayrıca temizlik
+hattasının metnini içerir.
+**Neden:** Normalde `ac` hatada oluşturduğu ağacın **tamamını** siler
+(`tests/yarim_cikti_temizligi.rs` bunu ağaç dökümüyle kanıtlar). Bu varyant
+yalnızca silme işleminin kendisi başarısız olduğunda — dosya başka bir süreçte
+kilitle, antivirüs tarama sırasında, izin kısıtlı bir ağda paylaşım — çıkar.
+**Çözüm:** Mesajda geçen yolu **elle silin**; diskte eksik/yarım düz metin
+kalıcıdır. Hedefte başka bir sürücü seçin ve antivirüs'ün gerçek zamanlı
+taramasını geçici olarak durdurun. Kalıcı çözüm için
+[geçici dizine yazıp atomik taşıma](#gelecek-geliştirmeler) gerekir.
 
 ---
 

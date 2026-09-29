@@ -11,11 +11,21 @@ use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use sealedbox::akis::{ac, muhurle, AcSecenekleri, Ilerleme, MuhurSecenekleri};
+use sealedbox::akis::{ac, muhurle, AcSecenekleri, Ilerleme, MuhurSecenekleri, KALICILIK_ARALIGI};
 use yardimci::{hizli_argon2, veri, GeciciDizin};
 
 const PAROLA: &[u8] = b"devam testi parcasi";
 const KUCUK_PARCA: u32 = 512 * 1024;
+
+/// Kalıcılık testleri için parça boyutu: `KALICILIK_ARALIGI` (8 MiB) tam olarak
+/// dört parçaya bölünür, böylece eşiğin nerede geçildiği sayısal olarak
+/// bilinir.
+const KALICILIK_PARCA: u32 = KALICILIK_ARALIGI as u32 / 4;
+
+/// Bir tam parça kaydının diskteki uzunluğu: nonce(12) + uzunluk(4) + şifre metni + etiket(16).
+fn kayit_uzunlugu(sifre_uzunlugu: u32) -> u64 {
+    12 + 4 + sifre_uzunlugu as u64 + 16
+}
 
 /// `n` parça yazıldıktan sonra işi durduran mühürleme seçeneği üretir.
 fn durduran(n: u64) -> MuhurSecenekleri {
@@ -229,5 +239,188 @@ fn yarim_yazilmis_gecici_dosya_yarim_parca_yazmaz() {
         fs::metadata(&kapsul).unwrap().len(),
         fs::metadata(&tam_referans).unwrap().len(),
         "yarim parca artigi kirpilmamis"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Devam sınırının kalıcılık garantisi
+// ---------------------------------------------------------------------------
+
+/// Geçici dosyanın sabit başlığındaki `yazilan_offset` alanını okur.
+///
+/// Alan başlığın `[80..88]` aralığındadır (bkz. `kapsul::SabitBaslik::kodla`).
+fn yazilan_offset(gecici_yol: &std::path::Path) -> u64 {
+    let bayt = fs::read(gecici_yol).expect("gecici dosya okunamadi");
+    assert!(bayt.len() >= 88, "gecici dosya sabit basliktan kisa");
+    u64::from_le_bytes(bayt[80..88].try_into().expect("8 bayt"))
+}
+
+/// `n` parça yazıldıktan sonra işi durduran, belirtilen parça boyutlu seçenek.
+fn durduran_boyutlu(n: u64, parca_boyutu: u32) -> MuhurSecenekleri {
+    MuhurSecenekleri {
+        parca_boyutu,
+        argon2: hizli_argon2(),
+        ustune_yaz: false,
+        devam: true,
+        ilerleme: Some(Arc::new(move |ilerleme: Ilerleme| {
+            if ilerleme.asama == "sifreleniyor" && ilerleme.parca >= n {
+                return Err(sealedbox::Hata::Iptal);
+            }
+            Ok(())
+        })),
+    }
+}
+
+#[test]
+fn kalicilik_esigi_asilmadan_devam_siniri_ilerlemez() {
+    // Toplam gövde 6 MiB: `KALICILIK_ARALIGI` (8 MiB) hic asilmaz, dolayisiyla
+    // hicbir `sync_data` olmaz. Baslikta `yazilan_offset` **sifir kalmalidir**:
+    // aksi halde baslik "bu kadar bayt kalici" derken veri hala yalnizca
+    // isletim sistemi tamponundadir ve elektrik kesintisinde kaybolur.
+    let gecici = GeciciDizin::yeni("kalicilik-esik-alti");
+    let parca_sayisi = 3u64;
+    let boyut = parca_sayisi as usize * KALICILIK_PARCA as usize;
+    assert!(
+        (boyut as u64) < KALICILIK_ARALIGI,
+        "test verisi esigin altinda kalmali"
+    );
+    let kaynak = gecici.yaz("a.bin", &veri(boyut, 51));
+    let kapsul = gecici.birles("a.sbx");
+    let gecici_yol = gecici.birles("a.sbx.sbxtmp");
+
+    for kesik in 1..parca_sayisi {
+        let _ = fs::remove_file(&gecici_yol);
+        let hata = muhurle(
+            &kaynak,
+            &kapsul,
+            PAROLA,
+            &durduran_boyutlu(kesik, KALICILIK_PARCA),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(hata, sealedbox::Hata::Iptal),
+            "{kesik}. parcada kesinti bekleniyordu, alinan: {hata:?}"
+        );
+        assert_eq!(
+            yazilan_offset(&gecici_yol),
+            0,
+            "{kesik}. parça yazıldıktan sonra başlık kalıcı ilerleme iddia etmemeli \
+             (esik aşılmadı, senkronizasyon yapılmadı)"
+        );
+    }
+}
+
+#[test]
+fn kalicilik_esigi_tam_parca_sinirinda_tazelenir() {
+    // Gövde 12 MiB: ilk dört parça (8 MiB) eşiği aşar, beşinci parça
+    // bekleyen aralıkta kalır. Kesinti beşinci parçadan sonra olur.
+    let gecici = GeciciDizin::yeni("kalicilik-esik-ustu");
+    let parca_sayisi = 6u64;
+    let boyut = parca_sayisi as usize * KALICILIK_PARCA as usize;
+    let icerik = veri(boyut, 57);
+    let kaynak = gecici.yaz("a.bin", &icerik);
+    let kapsul = gecici.birles("a.sbx");
+    let gecici_yol = gecici.birles("a.sbx.sbxtmp");
+
+    let kesik = 5u64;
+    let hata = muhurle(
+        &kaynak,
+        &kapsul,
+        PAROLA,
+        &durduran_boyutlu(kesik, KALICILIK_PARCA),
+    )
+    .unwrap_err();
+    assert!(matches!(hata, sealedbox::Hata::Iptal), "alinan: {hata:?}");
+
+    let kayit = kayit_uzunlugu(KALICILIK_PARCA);
+    let ofset = yazilan_offset(&gecici_yol);
+    assert_eq!(
+        ofset,
+        4 * kayit,
+        "yalnızca eşiği aşan ilk dört parça kalıcı ilan edilmeli"
+    );
+    assert_eq!(
+        ofset % kayit,
+        0,
+        "devam sınırı her zaman tam parça sınırında olmalı"
+    );
+    assert!(
+        ofset <= KALICILIK_ARALIGI + kayit,
+        "devam sınırı kalıcılık aralığını ({KALICILIK_ARALIGI} bayt) aşmamalı, \
+         görülen: {ofset}"
+    );
+    assert!(
+        ofset < kesik * kayit,
+        "senkronize edilmemiş parça 'yazılmış' sayılmamalı"
+    );
+}
+
+#[test]
+fn devam_edilen_kapsul_kalici_sinirdan_sonra_birebir_ayni_icerigi_verir() {
+    // 1a'nin işlevsel kanıtı: senkronize edilmemiş parçalar yeniden üretilir.
+    // Ayni nonce + anahtar + AAD + düz metin GCM'de bit bit ayni sifre metnini
+    // verdigi icin kapsul bayt bayt ayni cikar ve gidis-donus saglam kalir.
+    let gecici = GeciciDizin::yeni("kalicilik-gidis-donus");
+    let parca_sayisi = 6usize;
+    let boyut = parca_sayisi * KALICILIK_PARCA as usize;
+    let icerik = veri(boyut, 63);
+    let kaynak = gecici.yaz("a.bin", &icerik);
+    let kapsul = gecici.birles("a.sbx");
+
+    let _ = muhurle(
+        &kaynak,
+        &kapsul,
+        PAROLA,
+        &durduran_boyutlu(5, KALICILIK_PARCA),
+    );
+    assert!(
+        gecici.birles("a.sbx.sbxtmp").exists(),
+        "gecici dosya korunmali"
+    );
+
+    let rapor = muhurle(
+        &kaynak,
+        &kapsul,
+        PAROLA,
+        &MuhurSecenekleri {
+            parca_boyutu: KALICILIK_PARCA,
+            argon2: hizli_argon2(),
+            devam: true,
+            ..MuhurSecenekleri::default()
+        },
+    )
+    .unwrap();
+    assert!(rapor.devam_edildi, "devam yolu kullanilmis olmali");
+
+    // Kapsul durumu tamam ve kuyruk ozeti gecerli olmali. `yazilan_offset`
+    // payload alaninin tam uzunlugudur: duz metin + her kaydin 32 baytlik
+    // yuku (nonce 12 + uzunluk 4 + etiket 16).
+    let beklenen_ofset = boyut as u64 + parca_sayisi as u64 * 32;
+    assert_eq!(
+        yazilan_offset(&kapsul),
+        beklenen_ofset,
+        "bitmis kapsulde yazilan_offset payload uzunluguna esit olmali"
+    );
+    let hedef = gecici.birles("geri.bin");
+    ac(&kapsul, &hedef, PAROLA, &AcSecenekleri::default()).unwrap();
+    assert_eq!(fs::read(&hedef).unwrap(), icerik, "gidis-donus bozulmamali");
+
+    // Kirpilan yarim parca kalmiyor: kapsul boyutu tam bir mühürlemeyle ayni.
+    let tam_referans = gecici.birles("referans.sbx");
+    muhurle(
+        &kaynak,
+        &tam_referans,
+        PAROLA,
+        &MuhurSecenekleri {
+            parca_boyutu: KALICILIK_PARCA,
+            argon2: hizli_argon2(),
+            ..MuhurSecenekleri::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        fs::metadata(&kapsul).unwrap().len(),
+        fs::metadata(&tam_referans).unwrap().len(),
+        "devam edilen kapsul artik parca artigi icermemeli"
     );
 }

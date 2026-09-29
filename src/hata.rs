@@ -50,6 +50,21 @@ pub enum Hata {
     Kriptografik(String),
     /// Kullanıcı ilerleme geri çağrısı ile işi iptal etti.
     Iptal,
+    /// Çözme başarısız oldu **ve** oluşturulan çıktı ağacı kaldırılamadı.
+    ///
+    /// Diskte hassas verinin yarım veya eksik hâlde kaldığı durumdur; bu
+    /// yüzden ayrı bir varyanttır ve kalıcı kalan yolu mesajda bildirir. Asıl
+    /// hata [`sebep`](Self::YarimCiktiKaldi) alanında ve `Error::source`
+    /// zincirinde bulunur; temizleme hatası `temizlik` alanında düz metin olarak
+    /// taşınır çünkü zincirin sonunda görünmez kalması hatayı gizlerdi.
+    YarimCiktiKaldi {
+        /// Çözmeyi durduran asıl hata.
+        sebep: Box<Hata>,
+        /// Kaldırılamayan çıktı ağacının yolu.
+        yol: String,
+        /// Ağacı kaldıran `remove_*` çağrısının hata metni.
+        temizlik: String,
+    },
 }
 
 impl fmt::Display for Hata {
@@ -79,6 +94,14 @@ impl fmt::Display for Hata {
             Hata::BozukArguman(detay) => write!(f, "gecersiz arguman: {detay}"),
             Hata::Kriptografik(detay) => write!(f, "kriptografik hata: {detay}"),
             Hata::Iptal => write!(f, "islem kullanici tarafindan iptal edildi"),
+            Hata::YarimCiktiKaldi {
+                sebep,
+                yol,
+                temizlik,
+            } => write!(
+                f,
+                "cozme basarisiz oldu ve yarim cikti kaldirilamadi: '{yol}' (asil hata: {sebep}; temizlik: {temizlik})"
+            ),
         }
     }
 }
@@ -87,6 +110,7 @@ impl Error for Hata {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Hata::Io(hata) => Some(hata),
+            Hata::YarimCiktiKaldi { sebep, .. } => Some(&**sebep),
             _ => None,
         }
     }

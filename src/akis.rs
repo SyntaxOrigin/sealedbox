@@ -24,6 +24,27 @@
 //!    sonrasında geriye kalan her parça ya tamamen yazılmıştır ya da hiç
 //!    yazılmamıştır; ikinci durumdaki parçaların nonce'u henüz hiçbir şifre
 //!    metniyle eşleşmemiştir, bu yüzden yeniden kullanılması güvenlidir.
+//!
+//! ## Devam sınırının kalıcılık garantisi
+//!
+//! `yazilan_offset` bir **kalıcılık beyanıdır**: "buraya kadar olan gövde
+//! diske zorlandı". Bu beyan ancak gövde `sync_data` ile zorlandıktan **sonra**
+//! başlığa yazılır. Aksi sıralamada elektrik kesintisi başlığı kalıcı ama parça
+//! verisini kaybetmiş bir kapsül bırakırdı; devam o parçayı yeniden üretmeden
+//! atar ve nonce'i harcanmış sayar.
+//!
+//! Her parça için `fsync` çağırmak doğru ama aşırı pahalıdır (her parça için
+//! bir cihaz yazma bariyeri). Bunun yerine ilerleme
+//! [`KALICILIK_ARALIGI`] bayta kadar toplanır: gövde zorlanır, **sonra** ofset
+//! yazılır. Böylece `yazilan_offset` kalıcı sınırın **en fazla bir aralık
+//! gerisinde** kalır ve her zaman bir tam parça sınırındadır. Geride kalan
+//! parçalar yeniden üretilir; bu güvenlidir çünkü aynı nonce + aynı anahtar +
+//! aynı AAD + aynı düz metin GCM'de **bit bit aynı** şifre metnini üretir,
+//! yani yeniden üretim nonce'u harcamaz.
+//!
+//! Gövde bittiğinde son bekleyen ofset zorlanır, ardından `durum = TAMAM` başlığı
+//! ve kuyruk özeti yazılıp dosya `sync_all` ile tamamen kalıcı hâle getirilir;
+//! ancak ondan sonra kapsül hedef yola `rename` edilir.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -48,6 +69,16 @@ use crate::kripto::{
 
 /// Yarım kalmış mühürlemenin geçici dosya eki.
 const GECICI_EKI: &str = "sbxtmp";
+
+/// `yazilan_offset` kalıcılık adımının aralığı (bayt).
+///
+/// Bu kadar gövde baytı yazıldıktan sonra gövde `sync_data` ile diske
+/// zorlanır ve **ardından** başlıktaki devam sınırı tazelenir. Değer iki
+/// ölçütü birlikte karşılar: parça başına `fsync` maliyetini önler ve bir
+/// elektrik kesintisinde en fazla bu kadar baytın yeniden üretilmesine yol açar.
+/// Varsayılan 2 MiB parçayla bir 100 MiB dosyada bu yaklaşık 12 `fsync`
+/// demektir (parça başına 50 yerine).
+pub const KALICILIK_ARALIGI: u64 = 8 * 1024 * 1024;
 
 /// İlerleme geri çağrısının alabileceği olay.
 #[derive(Clone, Debug)]
@@ -202,7 +233,12 @@ pub struct MuhurRaporu {
     pub girdi_bayti: u64,
     /// Kapsül dosyasının toplam uzunluğu (bayt).
     pub kapsul_bayti: u64,
-    /// Kaldığı yerden devam edildiyse `true`.
+    /// Kaldığı yerden devam **yolu** kullanıldıysa `true`.
+    ///
+    /// Yarım kalmış geçici dosya bulundu ve yeniden kullanıldıysa `true` olur.
+    /// Kaç parçanın gerçekten atlandığı bu bayttan küçük olabilir: devam
+    /// sınırı ([`KALICILIK_ARALIGI`] bayta kadar) geride kaldığı için atlanan
+    /// parçalar yeniden üretilir. `false` ise sıfırdan mühürlendi.
     pub devam_edildi: bool,
     /// Geçen süre (milisaniye).
     pub sure_ms: u128,
@@ -473,9 +509,13 @@ fn muhurle_gecici(
             if let Some((dosya, baslik, ana_anahtar, tuz, kayitli)) =
                 devam_ac(gecici_yol, plan, parola)?
             {
-                let devam = baslik.yazilan_offset > 0;
                 muhurle_govde(dosya, plan, secenek, &baslik, &ana_anahtar, &tuz, &kayitli)?;
-                return Ok(devam);
+                // `devam_ac` uygun buldugu icin gecici dosya yeniden kullanildi.
+                // Atlanan parca sayisi `yazilan_offset`in kalicilik araligi
+                // kadar geride kalmasindan dolayi sifir da olabilir; bu yuzden
+                // bayt burada `yazilan_offset > 0` ile degil, yolun kullanilip
+                // kullanilmadigiyla belirlenir.
+                return Ok(true);
             }
         }
         std::fs::remove_file(gecici_yol)?;
@@ -590,6 +630,9 @@ fn devam_ac(
     // Yarim yazilmis son parcayi at: yalnizca tam parca sinirlari korunur.
     let hedef = BASLIK_UZUNLUGU as u64 + baslik.manifest_ayrilmis + baslik.yazilan_offset;
     dosya.set_len(hedef)?;
+    // Kirpma da kalici olmali: aksi halde ikinci bir kesintide kirpma geri
+    // alinir ve yarim parca "tamam" sayilir.
+    dosya.sync_all()?;
     Ok(Some((dosya, baslik, ana_anahtar, tuz, kayitli)))
 }
 
@@ -653,6 +696,7 @@ fn muhurle_govde(
     let mut atlanan = 0u64;
     let mut yazilan_parca = 0u64;
     let mut tamamlanan_dosya = 0u64;
+    let mut devam = DevamSayaci::yeni(payload_baslangic);
 
     for (sira, giris) in etkin_manifest.girdiler.iter().enumerate() {
         if giris.tur == Tur::Dizin {
@@ -693,8 +737,9 @@ fn muhurle_govde(
             dosya.write_all(&parca.sifre_uzunlugu.to_le_bytes())?;
             dosya.write_all(&tampon[..okunan])?;
             dosya.write_all(&etik)?;
-            let yeni_offset = parca.ofset + parca_kayit_uzunlugu(parca.sifre_uzunlugu);
-            ilerleme_yaz(&mut dosya, payload_baslangic, yeni_offset)?;
+            let kayit_bayt = parca_kayit_uzunlugu(parca.sifre_uzunlugu);
+            let yeni_offset = parca.ofset + kayit_bayt;
+            devam.ilerle(&mut dosya, yeni_offset, kayit_bayt)?;
             yazilan_parca += 1;
             secenek.bildir(
                 "sifreleniyor",
@@ -706,6 +751,10 @@ fn muhurle_govde(
         }
         tamamlanan_dosya += 1;
     }
+
+    // Son bekleyen ofseti zorla: `durum = TAMAM` yazilabilmesi icin butun
+    // govdenin diskte olmasi gerekir.
+    devam.kapat(&mut dosya)?;
 
     let toplam = payload_baslangic + plan.payload_len;
     let son_baslik = SabitBaslik {
@@ -737,8 +786,62 @@ fn muhurle_govde(
     let ozet = kapsul_ozeti(&mut dosya, toplam)?;
     dosya.seek(SeekFrom::Start(toplam))?;
     dosya.write_all(&ozet)?;
+    // Kapsul `rename` edilmeden once butun haliyle kalici olmali: hem son
+    // baslik (`durum = TAMAM`) hem de kuyruk ozeti bir sonraki acma'da
+    // dogrulanacak ve ikisi de kaybolursa kapsul kalici olarak bozuk kalir.
     dosya.flush()?;
+    dosya.sync_all()?;
     Ok(())
+}
+
+/// Devam sınırının kalıcılık adımlarını sayan yardımcı.
+///
+/// `yazilan_offset` alanı yalnızca **gövde `sync_data` ile diske zorlandıktan
+/// sonra** yazılır; bu sıralama sayesinde elektrik kesintisi başlıkta
+/// "bu kadar bayt yazıldı" beyanı bırakmaz, kısa bir beyan bırakır. Kısa
+/// beyan güvenlidir: `devam_ac` o noktadan sonraki parçaları yeniden üretir ve
+/// aynı nonce + anahtar + AAD + düz metin GCM'de bit bit aynı çıktı verdiği
+/// için yeniden üretim nonce'u harcamaz.
+struct DevamSayaci {
+    payload_baslangic: u64,
+    bekleyen_offset: u64,
+    bekleyen_bayt: u64,
+}
+
+impl DevamSayaci {
+    fn yeni(payload_baslangic: u64) -> Self {
+        DevamSayaci {
+            payload_baslangic,
+            bekleyen_offset: 0,
+            bekleyen_bayt: 0,
+        }
+    }
+
+    /// Yeni bir parça kaydının bittiğini not eder; eşik aşılırsa ofseti zorlar.
+    fn ilerle(&mut self, dosya: &mut File, yeni_offset: u64, kayit_bayt: u64) -> Result<(), Hata> {
+        self.bekleyen_offset = yeni_offset;
+        self.bekleyen_bayt = self.bekleyen_bayt.saturating_add(kayit_bayt);
+        if self.bekleyen_bayt >= KALICILIK_ARALIGI {
+            self.aralik_yaz(dosya)?;
+        }
+        Ok(())
+    }
+
+    /// Gövde bittiğinde kalan ofseti zorlar.
+    fn kapat(&mut self, dosya: &mut File) -> Result<(), Hata> {
+        if self.bekleyen_bayt > 0 {
+            self.aralik_yaz(dosya)?;
+        }
+        Ok(())
+    }
+
+    /// Sıralama güvenlik açısından kritik: önce gövde, sonra beyan.
+    fn aralik_yaz(&mut self, dosya: &mut File) -> Result<(), Hata> {
+        dosya.sync_data()?;
+        ilerleme_yaz(dosya, self.payload_baslangic, self.bekleyen_offset)?;
+        self.bekleyen_bayt = 0;
+        Ok(())
+    }
 }
 
 /// `yazilan_offset` alanını günceller; devamın güvenli sınırı budur.
@@ -746,6 +849,9 @@ fn muhurle_govde(
 /// Alan başlığın `[80..88]` aralığındadır ve AAD kapsamının **dışındadır**;
 /// bu yüzden yarım kalan bir yazma AAD'yi bozmaz, en kötü halde devam daha
 /// erken bir sınırdan başlar ve bazı parçalar yeniden yazılır.
+///
+/// Çağırmadan önce gövdenin `sync_data` ile zorlanmış olması gerekir; bu
+/// ön koşulu [`DevamSayaci`] sağlar.
 fn ilerleme_yaz(dosya: &mut File, payload_baslangic: u64, yeni_offset: u64) -> Result<(), Hata> {
     dosya.seek(SeekFrom::Start(80))?;
     dosya.write_all(&yeni_offset.to_le_bytes())?;
@@ -826,6 +932,68 @@ pub fn ac(
         std::fs::create_dir_all(&kok)?;
     }
 
+    let sonuc = ac_govde(
+        kapsul_yolu,
+        &baslik,
+        &manifest,
+        &ana_anahtar,
+        &tuz,
+        secenek,
+        &kok,
+        dizin_agaci,
+        baslangic,
+    );
+    match sonuc {
+        Ok(rapor) => Ok(rapor),
+        // Yarim agac birakma. Basarisizlik halinde diskte hassas verinin eksik
+        // bir kopyasi kalmasina izin vermek, hatayi kullaniciya gostermekten
+        // daha kotudur. Temizlik basarisiz olursa asil hata korunur ve kalici
+        // kalan yol ayri bir varyantle bildirilir.
+        Err(hata) => match ciktiyi_kaldir(&kok, dizin_agaci) {
+            Ok(()) => Err(hata),
+            Err(temizlik) => Err(Hata::YarimCiktiKaldi {
+                sebep: Box::new(hata),
+                yol: kok.display().to_string(),
+                temizlik: temizlik.to_string(),
+            }),
+        },
+    }
+}
+
+/// Çözme sırasında oluşan çıktıyı kaldırır.
+///
+/// Klasör kapsülünde kök ağaç, tek dosya kapsülünde ise dosyanın kendisi
+/// silinir. Nesne zaten yoksa hata sayılmaz: temizlik tamamlanmış demektir.
+fn ciktiyi_kaldir(kok: &Path, dizin_agaci: bool) -> Result<(), Hata> {
+    let sonuc = if dizin_agaci {
+        std::fs::remove_dir_all(kok)
+    } else {
+        std::fs::remove_file(kok)
+    };
+    match sonuc {
+        Ok(()) => Ok(()),
+        Err(hata) if hata.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(hata) => Err(Hata::Io(hata)),
+    }
+}
+
+/// Kapsül gövdesini parça parça çözüp `kok` altına yazar.
+///
+/// Her parça diske yazılmadan **önce** kendi etiketiyle doğrulanır. Hata
+/// dönerse oluşturulmuş olabilecek ağacın temizlenmesi [`ac`]'in
+/// sorumluluğundadır.
+#[allow(clippy::too_many_arguments)]
+fn ac_govde(
+    kapsul_yolu: &Path,
+    baslik: &SabitBaslik,
+    manifest: &DizinKaydi,
+    ana_anahtar: &[u8; ANAHTAR_UZUNLUGU],
+    tuz: &[u8; TUZ_UZUNLUGU],
+    secenek: &AcSecenekleri,
+    kok: &Path,
+    dizin_agaci: bool,
+    baslangic: Instant,
+) -> Result<AcRaporu, Hata> {
     let mut dosya = File::open(kapsul_yolu)?;
     let payload_baslangic = baslik.payload_ofseti();
     let toplam_parca = manifest.parca_sayisi();
@@ -860,14 +1028,14 @@ pub fn ac(
         // `join("")` Windows'ta gecersiz bir ad uretir, bu yuzden ayrica ele alinir.
         let goreli = manifest.kok_icindeki_yol(&giris.yol);
         let yol = if goreli.is_empty() {
-            kok.clone()
+            kok.to_path_buf()
         } else {
             kok.join(goreli)
         };
         if let Some(ebeveyn) = yol.parent() {
             std::fs::create_dir_all(ebeveyn)?;
         }
-        let alt = alt_anahtar(&ana_anahtar, &tuz, AMAÇ_DOSYA, sira as u64)?;
+        let alt = alt_anahtar(ana_anahtar, tuz, AMAÇ_DOSYA, sira as u64)?;
         let mut cikti = OpenOptions::new().write(true).create_new(true).open(&yol)?;
         let mut yazilan = 0u64;
         for (parca_sirasi, parca) in giris.parcalar.iter().enumerate() {
@@ -924,12 +1092,12 @@ pub fn ac(
             izin_uygulanamadi += 1;
         }
     }
-    if dizin_agaci && izin_uygula(&kok, 0o755) {
+    if dizin_agaci && izin_uygula(kok, 0o755) {
         izin_uygulanamadi += 1;
     }
 
     Ok(AcRaporu {
-        hedef: kok,
+        hedef: kok.to_path_buf(),
         dosya_sayisi: toplam_dosya,
         dizin_sayisi,
         parca_sayisi,

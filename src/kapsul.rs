@@ -98,7 +98,10 @@ impl SabitBaslik {
         bayt[16..20].copy_from_slice(&self.argon2_tur.to_le_bytes());
         bayt[20..24].copy_from_slice(&self.argon2_yol.to_le_bytes());
         bayt[24..28].copy_from_slice(&(TUZ_UZUNLUGU as u32).to_le_bytes());
-        // 28..44 tuz alanı; tuz kapsül başlığının parçası değildir (aşağıda).
+        // 28..44 tuz alanı. Tuz başlığın parçasıdır ama gizli değildir: Argon2
+        // girdisidir ve AAD kapsamının (0..64) dışında kaldığı için etiket
+        // doğrulamasına girmez. `kodla` yalnızca tuzsuz alanları doldurur; tuz
+        // `tuz_yaz` ile yazılır.
         bayt[44..56].copy_from_slice(&self.manifest_nonce);
         bayt[56..60].copy_from_slice(&self.girdi_sayisi.to_le_bytes());
         bayt[64..72].copy_from_slice(&self.manifest_ayrilmis.to_le_bytes());
