@@ -1,0 +1,63 @@
+# MühürKasa (SealedBox) — sürekli doğrulama
+#
+# WORKER_CONTRACT §1 "opsiyonel ama önerilir" maddesi uyarınca eklenmiştir.
+# Dört kalite kapısının (build / test / clippy / fmt) CI'da da yeşil kalmasını
+# sağlar. GitHub Actions iş akışı Rust kodunun kendisine **bağımlılık değildir**;
+# Cargo.toml'daki `[dependencies]` listesiyle ilgisi yoktur.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Kapsül üretiminde `panic = "abort"` kullanılır; testler kendi profiliyle
+  # çalıştığı için bu ayar `cargo test`'i etkilemez.
+  RUST_BACKTRACE: 1
+
+jobs:
+  kalite:
+    name: build / test / clippy / fmt
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust arac zinciri kurulumu
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Bicim denetimi
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (uyarilar hata sayilir)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Derleme (release)
+        run: cargo build --release
+
+      - name: Testler
+        run: cargo test --all-targets
+
+      - name: Dokümantasyon testleri
+        run: cargo test --doc
+
+  gizlilik:
+    name: sif taramasi
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ileri seviye gizli tarama
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

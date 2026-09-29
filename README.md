@@ -325,6 +325,8 @@ cargo fmt --check                          # çıktı boş
 ├── LICENSE.txt
 ├── README.md
 ├── .gitignore
+├── .github/
+│   └── workflows/ci.yml     build / test / clippy / fmt + gizli tarama
 ├── src/
 │   ├── lib.rs          çekirdek API ve modül yönlendirme
 │   ├── main.rs         mseal komut satırı arayüzü (clap)
