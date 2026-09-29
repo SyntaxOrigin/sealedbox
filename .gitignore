@@ -1,0 +1,9 @@
+/target/
+.env
+*.log
+.idea/
+.vscode/
+*.swp
+*.tmp
+*.sbx
+*.sbxtmp

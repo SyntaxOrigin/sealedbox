@@ -1,0 +1,46 @@
+[package]
+name = "sealedbox"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "MIT"
+description = "Akis halinde AES-256-GCM ile buyuk dosya ve klasor agaclarini muhurleyen komut satiri araci."
+repository = "https://github.com/SyntaxOrigin/sealedbox"
+readme = "README.md"
+keywords = ["cli", "sealedbox", "encryption", "aes-gcm"]
+categories = ["command-line-utilities", "cryptography"]
+
+[lib]
+name = "sealedbox"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mseal"
+path = "src/main.rs"
+
+[dependencies]
+# aes-gcm: kapsul govdesindeki her parcayi AES-256-GCM ile sifreler ve etikini dogrular (MANIFEST kart 17, madde 1).
+aes-gcm = "0.10"
+# argon2: paroladan bellek-zorlu ana malzeme turetir; Argon2id, RFC 9106 (MANIFEST kart 17, madde 2).
+argon2 = "0.5"
+# hkdf: ana malzemeden ana anahtari ve dosya basina bagimsiz alt anahtarlari turetir (nonce cakismasi riskini anahtar ayrimiyla da engeller).
+hkdf = "0.12"
+# sha2: kapsul duzeyinde SHA-512 butunluk ozeti uretir; parca etiklerinin kapsamadigi hatalari yakalar (rapor b10).
+sha2 = "0.10"
+# getrandom: tuz ve parca nonce'lari isletim sistemi kriptografik rastgeleliginden uretilir; `rand` bagimliligi yasakli.
+getrandom = "0.3"
+# zeroize: ana anahtar, alt anahtar ve duz metin tamponlari kullanildiktan sonra sifirlanir.
+zeroize = "1"
+# serde: alt komutlarin JSON cikti semasini turetilmis veri yapilariyla tanimlar (kaynak: src/main.rs).
+serde = { version = "1", features = ["derive"] }
+# serde_json: sifreleme/acma/dogrulama raporlarini makine-okunur JSON olarak yazar (kaynak: src/main.rs).
+serde_json = "1"
+# clap: `mseal sifrele|ac|liste|mseal-info|mseal-verify` alt komutlu komut satiri arayuzu (kaynak: src/main.rs).
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
